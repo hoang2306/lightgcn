@@ -4,9 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F 
 from torch.utils.data import DataLoader
 import scipy.sparse as sp 
-
-
-print('import successful')
+from collections import defaultdict
+from tqdm import tqdm 
 
 eps = 1e-8
 
@@ -28,7 +27,6 @@ def to_tensor(graph):
         torch.Size(graph.shape)
     )
     return graph 
-
 
 class light_gcn(nn.Module):
     def __init__(
@@ -71,7 +69,7 @@ class light_gcn(nn.Module):
         )
         return to_tensor(laplace_transform(graph)).to(self.device)
 
-    def forward(self, user, pos_item, neg_item):
+    def propagate(self):
         features = torch.cat([self.user_emb, self.item_emb], dim=0)
         all_features = [features]
         for i in range(self.n_layer):
@@ -84,17 +82,18 @@ class light_gcn(nn.Module):
             tensor=all_features,
             split_size_or_sections=[self.n_user, self.n_item]
         )
+        return user_feat, item_feat 
+
+    def forward(self, user, pos_item, neg_item):
+        user_feat, item_feat = self.propagate()
         # user, item: tensor or np
         return user_feat[user], item_feat[pos_item], item_feat[neg_item]
     
     def evaluate(self):
         return self.user_emb, self.item_emb
 
-
-
 def sampling_data(train_data, num_neg=1):
     user, pos_item = train_data.nonzero()
-
     data = []
     for u, pos_i in zip(user, pos_item):
         for _ in range(num_neg):
@@ -126,11 +125,56 @@ def bpr_loss(user_emb, pos_item_emb, neg_item_emb):
     loss = -torch.mean(F.logsigmoid(pos_score - neg_score) + eps) 
     return loss  
 
+def generate_synthetic_ui_data(n_user=100, n_item=300, min_items=5, max_items=10, seed=42):
+    np.random.seed(seed)
+    ui_data = []
+    for user_id in range(n_user):
+        n_interactions = np.random.randint(min_items, max_items + 1)
+        interacted_items = np.random.choice(n_item, size=n_interactions, replace=False)
+        for item_id in interacted_items:
+            ui_data.append([user_id, item_id])
+    return np.array(ui_data)
+
+def to_binary_matrix(ui_array, n_user, n_item):
+    mat = np.zeros((n_user, n_item), dtype=np.int32)
+    for u, i in ui_array:
+        mat[u, i] = 1
+    return mat
+
+def recall(output_topk, user_gt, item_gt):
+    predicted_items = output_topk[user_gt]
+    hits = (predicted_items == item_gt.unsqueeze(1)).any(dim=1).float()
+    recall = hits.mean().item()
+    return recall
+
+def evaluate_recall(score, dataloader):
+    # topk = [5,10,20,40,80]
+    topk = [5,10,20]
+    recall_list= defaultdict(list)
+
+    user, pos_item, neg_item = dataloader
+    for k in topk:
+        value, idx = torch.topk(score, k=k)
+        recall_k = recall(idx.to("cpu"), user, pos_item)
+        recall_list[k].append(recall_k)
+
+    return {k: np.mean(v) for k, v in recall_list.items()}
+
+def evaluate(model, dataloader, k=20):
+    u_emb, i_emb = model.evaluate()
+    score = u_emb @ i_emb.T
+    recall_ = evaluate_recall(score, dataloader)
+    return recall_
+
 
 # create dummy data 
-data = np.array([[1,0,1,0,1], [1,0,0,0,1], [0,0,0,1,1]])
+# data = np.array([[1,0,1,0,1], [1,0,0,0,1], [0,0,0,1,1]])
+n_user = 30
+n_item = 50
+data = generate_synthetic_ui_data(n_user=n_user, n_item=n_item, seed=1, min_items=10, max_items=20)
+data = to_binary_matrix(data, n_user=n_user, n_item=n_item)
+
 data_train = sampling_data(train_data=data, num_neg=1)
-# print(data.nonzero())
 n_user, n_item = data.shape 
 print(f'num user: {n_user}')
 print(f'num item: {n_item}')
@@ -139,7 +183,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 conf = {
     'device': device, 
     'epoch': 30,
-    'lr': 1e-2 
+    'lr': 1e-1
 }
 
 model = light_gcn(
@@ -150,11 +194,11 @@ model = light_gcn(
     conf=conf 
 ).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=conf['lr'])
-
-
 # data_train = DataLoader(data_train, batch_size=5, shuffle=True)
+print(f'len data train: {len(data_train)}')
 
-for epoch in range(conf['epoch']):
+training_bar = tqdm(range(conf['epoch']), total=conf['epoch'])
+for epoch in training_bar:
     user, pos_item, neg_item = data_train
     user = user.to(device)
     pos_item = pos_item.to(device)
@@ -165,16 +209,11 @@ for epoch in range(conf['epoch']):
     loss = bpr_loss(user_emb, pos_item_emb, neg_item_emb)
     optimizer.zero_grad()
     loss.backward()
-    print(f'loss: {loss}')
     optimizer.step()
-
-# test 
-with torch.no_grad():
-    model.eval()
-    user_emb, item_emb = model.evaluate()
-    score = user_emb @ item_emb.T 
-    # get score of user 0 
-    print(score[0].cpu())
-
-
+    print(f'loss: {loss}')
+    recall_dict = (evaluate(model=model, dataloader=data_train))
+    for k, v in recall_dict.items():
+        print(f'recall@{k}: {v}')
+    print('-' * 50)
+    
 
